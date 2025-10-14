@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List
+from typing import Dict, List, Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.engine import Result
@@ -102,3 +102,10 @@ def get_status_breakdown(session: Session) -> Dict[str, int]:
         else:
             breakdown[str(status)] += int(count)
     return dict(breakdown)
+
+
+def get_transaction_by_id(
+    session: Session, transaction_id: str
+) -> Optional[Transaction]:
+    stmt = select(Transaction).where(Transaction.transaction_id == transaction_id)
+    return session.execute(stmt).scalar_one_or_none()

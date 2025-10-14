@@ -19,10 +19,13 @@ class Transaction(Base):
     )
     api_key = Column(String(128), nullable=False, index=True)
     customer_name = Column(String(255), nullable=False)
+    customer_email = Column(String(255), nullable=True, index=True)
     amount_cents = Column(Integer, nullable=False)
     currency = Column(String(3), nullable=False, default="USD")
     status = Column(String(32), nullable=False, default="success")
-    metadata = Column(JSON, nullable=True)
+    extra = Column(JSON, nullable=True)
+    country = Column(String(64), nullable=True)
+    city = Column(String(128), nullable=True)
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,

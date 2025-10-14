@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 Base = declarative_base()
@@ -78,6 +78,7 @@ def get_session(engine=None):
 def init_db(engine=None):
     engine = engine or get_engine()
     Base.metadata.create_all(engine)
+    _ensure_additional_columns(engine)
     return engine
 
 
@@ -92,3 +93,34 @@ def session_scope(engine=None):
         raise
     finally:
         session.close()
+
+
+def _ensure_additional_columns(engine):
+    """Add newly introduced columns when running against existing SQLite DBs."""
+    inspector = inspect(engine)
+    if "transactions" not in inspector.get_table_names():
+        return
+
+    existing_columns = {col["name"] for col in inspector.get_columns("transactions")}
+    desired_columns = {
+        "customer_email": "TEXT",
+        "country": "TEXT",
+        "city": "TEXT",
+    }
+
+    missing = {col: col_type for col, col_type in desired_columns.items() if col not in existing_columns}
+    if not missing:
+        return
+
+    dialect = engine.dialect.name
+
+    with engine.begin() as conn:
+        for column, column_type in missing.items():
+            if dialect != "sqlite":
+                if column == "customer_email":
+                    column_type = "VARCHAR(255)"
+                else:
+                    column_type = "VARCHAR(128)"
+            conn.execute(
+                text(f"ALTER TABLE transactions ADD COLUMN {column} {column_type}")
+            )

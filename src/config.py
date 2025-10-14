@@ -7,14 +7,14 @@ class Settings:
     api_key: str
     database_url: str
     currency: str
-    refresh_interval_seconds: int
+    refresh_interval_seconds: float
 
 
 def load_settings() -> Settings:
     database_url = os.getenv("DATABASE_URL", "")
     api_key = os.getenv("PAYMENTS_API_KEY", "nvra_test_key_123456")
     currency = os.getenv("PAYMENTS_CURRENCY", "USD")
-    refresh_interval = int(os.getenv("DASHBOARD_REFRESH_SECONDS", "5"))
+    refresh_interval = float(os.getenv("DASHBOARD_REFRESH_SECONDS", "0.1"))
 
     return Settings(
         api_key=api_key,

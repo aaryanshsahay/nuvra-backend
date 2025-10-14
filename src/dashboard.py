@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from io import BytesIO
 from typing import Dict, List
 
+import base64
 import pandas as pd
 import streamlit as st
 
@@ -13,7 +15,10 @@ from db.queries import (
     get_recent_transactions,
     get_status_breakdown,
     get_summary,
+    get_transaction_by_id,
 )
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 
 
 settings = load_settings()
@@ -44,10 +49,15 @@ def _recent_transactions_rows(transactions) -> List[Dict[str, str]]:
             {
                 "Transaction": tx.transaction_id,
                 "Customer": tx.customer_name,
+                "Email": tx.customer_email or "—",
+                "Country": tx.country or "—",
+                "City": tx.city or "—",
                 "Amount": _format_currency(tx.amount_cents),
                 "Currency": tx.currency,
                 "Status": tx.status,
                 "Created At": created_display,
+                "_amount_cents": tx.amount_cents,
+                "_created_at": created_display,
             }
         )
     return rows
@@ -64,16 +74,131 @@ def _build_daily_volume_frame(daily: List[Dict[str, int]]) -> pd.DataFrame:
     return frame
 
 
-@st.cache_data(show_spinner=False)
-def load_snapshot(refresh_token: int):
-    ensure_database_ready()
-    with session_scope() as session:
+def _invoice_payloads(transactions) -> List[Dict[str, str]]:
+    payloads = []
+    for tx in transactions:
+        payloads.append(
+            {
+                "transaction_id": tx.transaction_id,
+                "customer_name": tx.customer_name,
+                "customer_email": tx.customer_email,
+                "amount_cents": tx.amount_cents,
+                "currency": tx.currency,
+                "status": tx.status,
+                "created_at": tx.created_at,
+                "country": tx.country,
+                "city": tx.city,
+                "extra": tx.extra,
+            }
+        )
+    return payloads
+
+
+def _generate_invoice_pdf(data: Dict[str, str]) -> bytes:
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+
+    pdf.setTitle(f"Invoice-{data['transaction_id']}")
+
+    margin = 72  # 1 inch
+    cursor_y = height - margin
+
+    pdf.setFont("Helvetica-Bold", 20)
+    pdf.drawString(margin, cursor_y, "Payment Invoice")
+    cursor_y -= 40
+
+    pdf.setFont("Helvetica", 12)
+    pdf.drawString(margin, cursor_y, f"Transaction ID: {data['transaction_id']}")
+    cursor_y -= 20
+    pdf.drawString(margin, cursor_y, f"Customer: {data['customer_name']}")
+    cursor_y -= 20
+    email = data.get("customer_email") or "Not provided"
+    pdf.drawString(margin, cursor_y, f"Email: {email}")
+    cursor_y -= 20
+    location_bits = [
+        bit for bit in [data.get("city"), data.get("country")] if bit
+    ]
+    location = ", ".join(location_bits) if location_bits else "Not provided"
+    pdf.drawString(margin, cursor_y, f"Location: {location}")
+    cursor_y -= 20
+    pdf.drawString(margin, cursor_y, f"Currency: {data['currency']}")
+    cursor_y -= 20
+
+    amount = _format_currency(data["amount_cents"])
+    pdf.drawString(margin, cursor_y, f"Amount: {amount}")
+    cursor_y -= 20
+
+    status = data.get("status", "success").title()
+    pdf.drawString(margin, cursor_y, f"Status: {status}")
+    cursor_y -= 20
+
+    created_at = data.get("created_at")
+    created_display = (
+        created_at.isoformat() if isinstance(created_at, datetime) else str(created_at)
+    )
+    pdf.drawString(margin, cursor_y, f"Created At: {created_display}")
+    cursor_y -= 40
+
+    pdf.setFont("Helvetica", 10)
+    pdf.drawString(
+        margin,
+        cursor_y,
+        "This is a sample invoice generated for demonstration purposes only.",
+    )
+
+    pdf.showPage()
+    pdf.save()
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _render_invoice_viewer(data: Dict[str, str], pdf_bytes: bytes):
+    pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+    st.markdown(f"**{data['customer_name']}** — {_format_currency(data['amount_cents'])}")
+    st.caption(f"Transaction: {data['transaction_id']}")
+    st.download_button(
+        "Download PDF",
+        data=pdf_bytes,
+        file_name=f"invoice-{data['transaction_id']}.pdf",
+        mime="application/pdf",
+        key=f"download-{data['transaction_id']}",
+    )
+    iframe_html = f"""
+        <iframe
+            src="data:application/pdf;base64,{pdf_b64}"
+            width="100%"
+            height="500"
+            style="border: none;"
+        ></iframe>
+    """
+    st.markdown(iframe_html, unsafe_allow_html=True)
+
+
+def load_snapshot():
+    engine = ensure_database_ready()
+    with session_scope(engine=engine) as session:
         summary = get_summary(session)
         recent = get_recent_transactions(session)
         daily = get_daily_volume(session, days=14)
         statuses = get_status_breakdown(session)
 
-    recent_df = pd.DataFrame(_recent_transactions_rows(recent))
+    recent_rows = _recent_transactions_rows(recent)
+    display_rows = [
+        {
+            key: row[key]
+            for key in (
+                "Transaction",
+                "Customer",
+                "Amount",
+                "Currency",
+                "Created At",
+                "Status",
+            )
+        }
+        for row in recent_rows
+    ]
     daily_df = _build_daily_volume_frame(daily)
     status_df = (
         pd.DataFrame(list(statuses.items()), columns=["status", "count"])
@@ -83,9 +208,10 @@ def load_snapshot(refresh_token: int):
 
     return {
         "summary": summary,
-        "recent": recent_df,
+        "recent": display_rows,
         "daily": daily_df,
         "status": status_df,
+        "invoices": _invoice_payloads(recent),
     }
 
 
@@ -114,12 +240,55 @@ def _render_kpi_cards(summary: Dict[str, int]):
         st.caption(f"Latest transaction at: {latest}")
 
 
-def _render_recent_table(recent_df: pd.DataFrame):
+def _render_recent_table(rows: List[Dict[str, str]], invoices: List[Dict[str, str]]):
     st.subheader("Latest Transactions")
-    if recent_df.empty:
+    if not rows:
         st.info("No transactions yet. Send a request to populate the dashboard.")
         return
-    st.dataframe(recent_df, use_container_width=True, hide_index=True)
+
+    header = st.columns([2.6, 2, 1.4, 1.1, 1.6, 1.3, 0.6])
+    header[0].markdown("**Transaction**")
+    header[1].markdown("**Customer**")
+    header[2].markdown("**Amount**")
+    header[3].markdown("**Currency**")
+    header[4].markdown("**Created At**")
+    header[5].markdown("**Status**")
+    header[6].markdown("**Invoice**")
+
+    st.write("---")
+
+    for row, invoice in zip(rows, invoices):
+        cols = st.columns([2.6, 2, 1.4, 1.1, 1.6, 1.3, 0.6])
+        tx_id = invoice["transaction_id"]
+        short_id = tx_id if len(tx_id) <= 12 else f"{tx_id[:10]}…"
+
+        with cols[0]:
+            if st.button(
+                short_id,
+                key=f"tx-detail-{tx_id}",
+                help="View transaction details",
+            ):
+                st.session_state["view"] = "transaction_detail"
+                st.session_state["active_transaction_id"] = tx_id
+                st.session_state["active_invoice"] = None
+                rerun = getattr(st, "rerun", None)
+                if callable(rerun):
+                    rerun()
+            st.caption(tx_id)
+
+        cols[1].markdown(row["Customer"])
+        cols[2].markdown(row["Amount"])
+        cols[3].markdown(row["Currency"])
+        cols[4].markdown(row["Created At"])
+        cols[5].markdown(row["Status"].title())
+
+        with cols[6]:
+            if st.button(
+                "🧾",
+                key=f"invoice-btn-{invoice['transaction_id']}",
+                help="Invoice",
+            ):
+                st.session_state["active_invoice"] = invoice
 
 
 def _render_charts(daily_df: pd.DataFrame, status_df: pd.DataFrame):
@@ -148,8 +317,11 @@ def _curl_example(api_key: str) -> str:
     endpoint = "http://localhost:8000/transactions"
     payload = """{
   "name": "Ada Lovelace",
+  "email": "ada@example.com",
   "price": 19.99,
-  "currency": "USD"
+  "currency": "USD",
+  "country": "UK",
+  "city": "London"
 }"""
     curl_lines = [
         "curl -X POST \\",
@@ -161,14 +333,17 @@ def _curl_example(api_key: str) -> str:
     return "\n".join(curl_lines)
 
 
-def main():
-    st.set_page_config(page_title="Payments Dashboard", layout="wide")
+def _render_dashboard():
     st.title("Payments Dashboard")
 
-    refresh_token = st.session_state.get("manual_refresh_token", 0)
-    if hasattr(st, "experimental_autorefresh"):
-        refresh_token += st.experimental_autorefresh(
-            interval=settings.refresh_interval_seconds * 1000,
+    st.session_state["active_transaction_id"] = None
+
+    active_invoice = st.session_state.get("active_invoice")
+
+    if hasattr(st, "experimental_autorefresh") and not active_invoice:
+        interval_ms = max(1, int(settings.refresh_interval_seconds * 1000))
+        st.experimental_autorefresh(
+            interval=interval_ms,
             key="dashboard_autorefresh",
             limit=10_000,
         )
@@ -180,17 +355,140 @@ def main():
         st.write("Sample `curl` to simulate a payment:")
         st.code(_curl_example(settings.api_key))
 
-    if st.button("Refresh now"):
-        st.session_state["manual_refresh_token"] = (
-            st.session_state.get("manual_refresh_token", 0) + 1
-        )
-        st.experimental_rerun()
-
-    snapshot = load_snapshot(refresh_token)
+    manual_refresh = st.button("Refresh now")
+    snapshot = load_snapshot()
+    if manual_refresh:
+        toast = getattr(st, "toast", None)
+        if callable(toast):
+            toast("Dashboard refreshed", icon="✅")
 
     _render_kpi_cards(snapshot["summary"])
     _render_charts(snapshot["daily"], snapshot["status"])
-    _render_recent_table(snapshot["recent"])
+    _render_recent_table(snapshot["recent"], snapshot["invoices"])
+
+    _render_invoice_modal()
+
+
+def _render_invoice_modal():
+    active = st.session_state.get("active_invoice")
+    if not active:
+        return
+
+    pdf_bytes = _generate_invoice_pdf(active)
+    if hasattr(st, "modal"):
+        with st.modal(f"Invoice · {active['transaction_id']}", key="invoice-modal"):
+            _render_invoice_viewer(active, pdf_bytes)
+            if st.button("Close", key="close-invoice"):
+                st.session_state["active_invoice"] = None
+    else:
+        st.warning("Upgrade Streamlit to view invoices in a modal dialog.")
+        _render_invoice_viewer(active, pdf_bytes)
+        if st.button("Close", key="close-invoice"):
+            st.session_state["active_invoice"] = None
+
+
+def _render_transaction_detail(transaction_id: str):
+    st.title("Transaction Details")
+
+    st.session_state["active_invoice"] = None
+
+    if st.button("← Back to dashboard", key="back-to-dashboard"):
+        st.session_state["view"] = "dashboard"
+        st.session_state["active_transaction_id"] = None
+        st.session_state["active_invoice"] = None
+        rerun = getattr(st, "rerun", None)
+        if callable(rerun):
+            rerun()
+
+    engine = ensure_database_ready()
+    with session_scope(engine=engine) as session:
+        transaction = get_transaction_by_id(session, transaction_id)
+
+    if not transaction:
+        st.warning("Transaction not found. It may have been deleted.")
+        return
+
+    info_columns = st.columns(4)
+    info_columns[0].markdown(
+        f"**Customer**\n\n{transaction.customer_name}"
+    )
+    info_columns[1].markdown(
+        f"**Email**\n\n{transaction.customer_email or '—'}"
+    )
+    info_columns[2].markdown(
+        f"**Amount**\n\n{_format_currency(transaction.amount_cents)}"
+    )
+    info_columns[3].markdown(
+        f"**Status**\n\n{transaction.status.title()}"
+    )
+
+    meta_cols = st.columns(2)
+    meta_cols[0].markdown(f"**Transaction ID**\n\n`{transaction.transaction_id}`")
+    meta_cols[0].markdown(f"**API Key**\n\n`{transaction.api_key}`")
+    created_display = (
+        transaction.created_at.isoformat()
+        if isinstance(transaction.created_at, datetime)
+        else str(transaction.created_at)
+    )
+    location = ", ".join(
+        [piece for piece in [transaction.city, transaction.country] if piece]
+    ) or "Not provided"
+    meta_cols[1].markdown(f"**Created At**\n\n{created_display}")
+    meta_cols[1].markdown(f"**Location**\n\n{location}")
+
+    st.write("---")
+    st.subheader("Invoice")
+    invoice_payload = {
+        "transaction_id": transaction.transaction_id,
+        "customer_name": transaction.customer_name,
+        "customer_email": transaction.customer_email,
+        "amount_cents": transaction.amount_cents,
+        "currency": transaction.currency,
+        "status": transaction.status,
+        "created_at": transaction.created_at,
+        "country": transaction.country,
+        "city": transaction.city,
+        "extra": transaction.extra,
+    }
+    pdf_bytes = _generate_invoice_pdf(invoice_payload)
+    _render_invoice_viewer(invoice_payload, pdf_bytes)
+
+    st.write("---")
+    st.subheader("Metadata")
+    meta_data = {
+        "Customer": transaction.customer_name,
+        "Email": transaction.customer_email,
+        "Country": transaction.country,
+        "City": transaction.city,
+        "Amount (cents)": transaction.amount_cents,
+        "Currency": transaction.currency,
+        "Status": transaction.status,
+        "Transaction ID": transaction.transaction_id,
+        "API Key": transaction.api_key,
+        "Created At": created_display,
+    }
+    st.json(meta_data)
+
+    if transaction.extra:
+        st.subheader("Additional Metadata")
+        st.json(transaction.extra)
+
+
+def main():
+    st.set_page_config(page_title="Payments Dashboard", layout="wide")
+
+    st.session_state.setdefault("view", "dashboard")
+    st.session_state.setdefault("active_invoice", None)
+    st.session_state.setdefault("active_transaction_id", None)
+
+    view = st.session_state.get("view", "dashboard")
+    active_transaction_id = st.session_state.get("active_transaction_id")
+
+    if view == "transaction_detail" and active_transaction_id:
+        _render_transaction_detail(active_transaction_id)
+    else:
+        st.session_state["view"] = "dashboard"
+        _render_dashboard()
 
 
 if __name__ == "__main__":
