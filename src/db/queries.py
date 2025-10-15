@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.engine import Result
 from sqlalchemy.orm import Session
 
@@ -137,3 +137,67 @@ def create_user(
     session.add(user)
     session.flush()
     return user
+
+
+def _apply_transaction_filters(
+    stmt,
+    api_key: str,
+    start_at: Optional[datetime] = None,
+    end_at: Optional[datetime] = None,
+    min_amount_cents: Optional[int] = None,
+    max_amount_cents: Optional[int] = None,
+    statuses: Optional[Sequence[str]] = None,
+):
+    conditions = [Transaction.api_key == api_key]
+    if start_at:
+        conditions.append(Transaction.created_at >= start_at)
+    if end_at:
+        conditions.append(Transaction.created_at <= end_at)
+    if min_amount_cents is not None:
+        conditions.append(Transaction.amount_cents >= min_amount_cents)
+    if max_amount_cents is not None:
+        conditions.append(Transaction.amount_cents <= max_amount_cents)
+    if statuses:
+        conditions.append(Transaction.status.in_(statuses))
+
+    return stmt.where(and_(*conditions)) if conditions else stmt
+
+
+def get_transactions_filtered(
+    session: Session,
+    api_key: str,
+    limit: int,
+    offset: int = 0,
+    start_at: Optional[datetime] = None,
+    end_at: Optional[datetime] = None,
+    min_amount_cents: Optional[int] = None,
+    max_amount_cents: Optional[int] = None,
+    statuses: Optional[Sequence[str]] = None,
+) -> Tuple[List[Transaction], int]:
+    base_stmt = select(Transaction).order_by(Transaction.created_at.desc())
+    base_stmt = _apply_transaction_filters(
+        base_stmt,
+        api_key=api_key,
+        start_at=start_at,
+        end_at=end_at,
+        min_amount_cents=min_amount_cents,
+        max_amount_cents=max_amount_cents,
+        statuses=statuses,
+    )
+
+    paginated = base_stmt.limit(limit).offset(offset)
+    records = session.execute(paginated).scalars().all()
+
+    count_stmt = select(func.count(Transaction.id))
+    count_stmt = _apply_transaction_filters(
+        count_stmt,
+        api_key=api_key,
+        start_at=start_at,
+        end_at=end_at,
+        min_amount_cents=min_amount_cents,
+        max_amount_cents=max_amount_cents,
+        statuses=statuses,
+    )
+    total = session.execute(count_stmt).scalar_one()
+
+    return records, int(total)

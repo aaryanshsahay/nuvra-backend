@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timezone
 from io import BytesIO
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import base64
 import pandas as pd
@@ -11,20 +12,31 @@ import streamlit as st
 from config import load_settings
 from auth import generate_api_key, hash_password, verify_password
 from db import get_engine, init_db, session_scope
+from db.models import Transaction
 from db.queries import (
     get_daily_volume,
-    get_recent_transactions,
     get_status_breakdown,
     get_summary,
     get_transaction_by_id,
     get_user_by_username,
     create_user,
+    get_transactions_filtered,
 )
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
 
 settings = load_settings()
+LOGO_PATH = Path(__file__).resolve().parent / "nuvra_logo.jpeg"
+
+TABLE_PAGE_SIZE = 100
+DEFAULT_TABLE_FILTERS = {
+    "start_date": None,
+    "end_date": None,
+    "min_amount": None,
+    "max_amount": None,
+    "statuses": [],
+}
 
 
 @st.cache_resource
@@ -34,37 +46,20 @@ def ensure_database_ready():
     return engine
 
 
+def _render_brand_header(subtitle: Optional[str] = None):
+    cols = st.columns([0.16, 0.84])
+    with cols[0]:
+        if LOGO_PATH.exists():
+            st.image(str(LOGO_PATH), use_container_width=True)
+    with cols[1]:
+        st.title("Nuvra Payments Dashboard")
+        if subtitle:
+            st.caption(subtitle)
+
+
 def _format_currency(amount_cents: int) -> str:
     dollars = amount_cents / 100
     return f"{settings.currency} {dollars:,.2f}"
-
-
-def _recent_transactions_rows(transactions) -> List[Dict[str, str]]:
-    rows = []
-    for tx in transactions:
-        created = tx.created_at
-        if isinstance(created, datetime):
-            created_display = created.isoformat()
-        else:
-            created_display = str(created)
-
-        rows.append(
-            {
-                "Transaction": tx.transaction_id,
-                "Customer": tx.customer_name,
-                "Email": tx.customer_email or "—",
-                "Country": tx.country or "—",
-                "City": tx.city or "—",
-                "Amount": _format_currency(tx.amount_cents),
-                "Currency": tx.currency,
-                "Status": tx.status,
-                "Created At": created_display,
-                "_amount_cents": tx.amount_cents,
-                "_created_at": created_display,
-            }
-        )
-    return rows
-
 
 def _build_daily_volume_frame(daily: List[Dict[str, int]]) -> pd.DataFrame:
     if not daily:
@@ -199,29 +194,70 @@ def _logout():
         rerun()
 
 
-def load_snapshot(api_key: str):
+def _convert_filters_for_query(filters: Dict[str, object]) -> Dict[str, object]:
+    start_at = filters.get("start_date")
+    end_at = filters.get("end_date")
+    tz = timezone.utc
+    start_dt = None
+    end_dt = None
+    if start_at:
+        start_dt = datetime.combine(start_at, datetime.min.time()).replace(tzinfo=tz)
+    if end_at:
+        # Include the entire end day by adding almost one day then subtract microsecond
+        end_dt = datetime.combine(end_at, datetime.max.time()).replace(tzinfo=tz)
+
+    min_amount = filters.get("min_amount")
+    max_amount = filters.get("max_amount")
+    min_amount_cents = int(min_amount * 100) if min_amount is not None else None
+    max_amount_cents = int(max_amount * 100) if max_amount is not None else None
+
+    statuses = filters.get("statuses") or None
+    return {
+        "start_at": start_dt,
+        "end_at": end_dt,
+        "min_amount_cents": min_amount_cents,
+        "max_amount_cents": max_amount_cents,
+        "statuses": statuses,
+    }
+
+
+def _transactions_dataframe(transactions: List[Transaction]) -> pd.DataFrame:
+    rows = []
+    for tx in transactions:
+        created = tx.created_at.isoformat() if isinstance(tx.created_at, datetime) else str(tx.created_at)
+        rows.append(
+            {
+                "Transaction": tx.transaction_id,
+                "Customer": tx.customer_name,
+                "Email": tx.customer_email or "",
+                "Country": tx.country or "",
+                "City": tx.city or "",
+                "Amount": _format_currency(tx.amount_cents),
+                "Currency": tx.currency,
+                "Status": tx.status,
+                "Created At": created,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def load_snapshot(api_key: str, table_filters: Dict[str, object], page: int, page_size: int):
     engine = ensure_database_ready()
     with session_scope(engine=engine) as session:
         summary = get_summary(session, api_key=api_key)
-        recent = get_recent_transactions(session, api_key=api_key)
         daily = get_daily_volume(session, days=14, api_key=api_key)
         statuses = get_status_breakdown(session, api_key=api_key)
 
-    recent_rows = _recent_transactions_rows(recent)
-    display_rows = [
-        {
-            key: row[key]
-            for key in (
-                "Transaction",
-                "Customer",
-                "Amount",
-                "Currency",
-                "Created At",
-                "Status",
-            )
-        }
-        for row in recent_rows
-    ]
+        filter_kwargs = _convert_filters_for_query(table_filters)
+        records, total = get_transactions_filtered(
+            session,
+            api_key=api_key,
+            limit=page_size,
+            offset=page * page_size,
+            **filter_kwargs,
+        )
+
+    table_df = _transactions_dataframe(records)
     daily_df = _build_daily_volume_frame(daily)
     status_df = (
         pd.DataFrame(list(statuses.items()), columns=["status", "count"])
@@ -231,16 +267,20 @@ def load_snapshot(api_key: str):
 
     return {
         "summary": summary,
-        "recent": display_rows,
         "daily": daily_df,
         "status": status_df,
-        "invoices": _invoice_payloads(recent),
+        "invoices": _invoice_payloads(records),
+        "table": {
+            "data": table_df,
+            "total": total,
+            "raw": records,
+        },
+        "status_options": sorted(statuses.keys()),
     }
 
 
 def _render_auth():
-    st.title("Payments Dashboard")
-    st.caption("Sign in to view your transactions and API key.")
+    _render_brand_header("Sign in to view your transactions and API key.")
 
     tabs = st.tabs(["Login", "Sign Up"])
 
@@ -329,55 +369,198 @@ def _render_kpi_cards(summary: Dict[str, int]):
         st.caption(f"Latest transaction at: {latest}")
 
 
-def _render_recent_table(rows: List[Dict[str, str]], invoices: List[Dict[str, str]]):
-    st.subheader("Latest Transactions")
-    if not rows:
-        st.info("No transactions yet. Send a request to populate the dashboard.")
-        return
+def _render_transactions_section(user: Dict[str, str], snapshot: Dict[str, object]):
+    st.subheader("Transactions")
 
-    header = st.columns([2.6, 2, 1.4, 1.1, 1.6, 1.3, 0.6])
-    header[0].markdown("**Transaction**")
-    header[1].markdown("**Customer**")
-    header[2].markdown("**Amount**")
-    header[3].markdown("**Currency**")
-    header[4].markdown("**Created At**")
-    header[5].markdown("**Status**")
-    header[6].markdown("**Invoice**")
+    filters = st.session_state.get("table_filters")
+    if filters is None:
+        filters = DEFAULT_TABLE_FILTERS.copy()
+        st.session_state["table_filters"] = filters
+    page = st.session_state.get("table_page", 0)
 
-    st.write("---")
+    status_options = snapshot.get("status_options", [])
 
-    for row, invoice in zip(rows, invoices):
-        cols = st.columns([2.6, 2, 1.4, 1.1, 1.6, 1.3, 0.6])
-        tx_id = invoice["transaction_id"]
-        short_id = tx_id if len(tx_id) <= 12 else f"{tx_id[:10]}…"
+    with st.form("transactions_filters"):
+        row1 = st.columns(2)
+        with row1[0]:
+            use_start = st.checkbox(
+                "Filter from date",
+                value=filters.get("start_date") is not None,
+                key="filter_use_start",
+            )
+            start_value = filters.get("start_date") or date.today()
+            start_date_input = st.date_input(
+                "Start date",
+                value=start_value,
+                key="filter_start_date",
+                disabled=not use_start,
+            )
 
-        with cols[0]:
-            if st.button(
-                short_id,
-                key=f"tx-detail-{tx_id}",
-                help="View transaction details",
-            ):
-                st.session_state["view"] = "transaction_detail"
-                st.session_state["active_transaction_id"] = tx_id
-                st.session_state["active_invoice"] = None
+        with row1[1]:
+            use_end = st.checkbox(
+                "Filter to date",
+                value=filters.get("end_date") is not None,
+                key="filter_use_end",
+            )
+            end_value = filters.get("end_date") or date.today()
+            end_date_input = st.date_input(
+                "End date",
+                value=end_value,
+                key="filter_end_date",
+                disabled=not use_end,
+            )
+
+        row2 = st.columns(3)
+        with row2[0]:
+            min_amount_str = st.text_input(
+                "Min amount",
+                value="" if filters.get("min_amount") is None else str(filters["min_amount"]),
+                placeholder="e.g. 10.00",
+                key="filter_min_amount",
+            )
+        with row2[1]:
+            max_amount_str = st.text_input(
+                "Max amount",
+                value="" if filters.get("max_amount") is None else str(filters["max_amount"]),
+                placeholder="e.g. 250.00",
+                key="filter_max_amount",
+            )
+        with row2[2]:
+            status_selection = st.multiselect(
+                "Status",
+                options=status_options,
+                default=filters.get("statuses", []),
+                key="filter_statuses",
+            )
+
+        action_cols = st.columns([0.18, 0.18, 0.64])
+        apply_filters = action_cols[0].form_submit_button("Apply filters")
+        reset_filters = action_cols[1].form_submit_button("Reset")
+
+        def _parse_amount(value: str) -> Optional[float]:
+            value = value.strip()
+            if not value:
+                return None
+            try:
+                amt = float(value)
+                return max(0.0, amt)
+            except ValueError:
+                st.warning("Amount filters must be numeric (e.g. 19.99).")
+                return None
+
+        if apply_filters:
+            new_filters = DEFAULT_TABLE_FILTERS.copy()
+            if use_start:
+                new_filters["start_date"] = start_date_input
+            if use_end:
+                new_filters["end_date"] = end_date_input
+
+            min_amount = _parse_amount(min_amount_str)
+            max_amount = _parse_amount(max_amount_str)
+            if min_amount is not None and max_amount is not None and min_amount > max_amount:
+                st.warning("Min amount cannot exceed max amount.")
+            else:
+                new_filters["min_amount"] = min_amount
+                new_filters["max_amount"] = max_amount
+                new_filters["statuses"] = status_selection
+                st.session_state["table_filters"] = new_filters
+                st.session_state["table_page"] = 0
                 rerun = getattr(st, "rerun", None)
                 if callable(rerun):
                     rerun()
-            st.caption(tx_id)
 
-        cols[1].markdown(row["Customer"])
-        cols[2].markdown(row["Amount"])
-        cols[3].markdown(row["Currency"])
-        cols[4].markdown(row["Created At"])
-        cols[5].markdown(row["Status"].title())
+        if reset_filters:
+            st.session_state["table_filters"] = DEFAULT_TABLE_FILTERS.copy()
+            st.session_state["table_page"] = 0
+            rerun = getattr(st, "rerun", None)
+            if callable(rerun):
+                rerun()
 
-        with cols[6]:
-            if st.button(
-                "🧾",
-                key=f"invoice-btn-{invoice['transaction_id']}",
-                help="Invoice",
-            ):
-                st.session_state["active_invoice"] = invoice
+    table_info = snapshot["table"]
+    df = table_info["data"]
+    total = table_info["total"]
+    records = table_info["raw"]
+
+    if df.empty:
+        st.info("No transactions match the current filters.")
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    start_idx = page * TABLE_PAGE_SIZE
+    end_idx = min(total, start_idx + TABLE_PAGE_SIZE)
+    if total:
+        st.caption(f"Showing {start_idx + 1}-{end_idx} of {total} transactions")
+    else:
+        st.caption("No transactions to display")
+
+    pager_cols = st.columns([0.2, 0.2, 0.6])
+    prev_disabled = page == 0
+    next_disabled = end_idx >= total
+
+    if pager_cols[0].button("← Previous", disabled=prev_disabled):
+        st.session_state["table_page"] = max(0, page - 1)
+        rerun = getattr(st, "rerun", None)
+        if callable(rerun):
+            rerun()
+
+    if pager_cols[1].button("Next →", disabled=next_disabled):
+        st.session_state["table_page"] = page + 1
+        rerun = getattr(st, "rerun", None)
+        if callable(rerun):
+            rerun()
+
+    if records:
+        st.write("---")
+        st.caption("Quick actions")
+        for tx in records:
+            cols = st.columns([2.6, 2, 1.4, 1.1, 1.6, 1.3, 0.6])
+            tx_id = tx.transaction_id
+            short_id = tx_id if len(tx_id) <= 12 else f"{tx_id[:10]}…"
+
+            with cols[0]:
+                if st.button(
+                    short_id,
+                    key=f"tx-detail-{tx_id}",
+                    help="View transaction details",
+                ):
+                    st.session_state["view"] = "transaction_detail"
+                    st.session_state["active_transaction_id"] = tx_id
+                    st.session_state["active_invoice"] = None
+                    rerun = getattr(st, "rerun", None)
+                    if callable(rerun):
+                        rerun()
+                st.caption(tx_id)
+
+            cols[1].markdown(tx.customer_name)
+            cols[2].markdown(_format_currency(tx.amount_cents))
+            cols[3].markdown(tx.currency)
+            created_display = (
+                tx.created_at.isoformat()
+                if isinstance(tx.created_at, datetime)
+                else str(tx.created_at)
+            )
+            cols[4].markdown(created_display)
+            cols[5].markdown(tx.status.title())
+
+            with cols[6]:
+                if st.button(
+                    "🧾",
+                    key=f"invoice-btn-{tx.transaction_id}",
+                    help="Invoice",
+                ):
+                    st.session_state["active_invoice"] = {
+                        "transaction_id": tx.transaction_id,
+                        "customer_name": tx.customer_name,
+                        "customer_email": tx.customer_email,
+                        "amount_cents": tx.amount_cents,
+                        "currency": tx.currency,
+                        "status": tx.status,
+                        "created_at": tx.created_at,
+                        "country": tx.country,
+                        "city": tx.city,
+                        "extra": tx.extra,
+                        "api_key": tx.api_key,
+                    }
 
 
 def _render_charts(daily_df: pd.DataFrame, status_df: pd.DataFrame):
@@ -423,12 +606,12 @@ def _curl_example(api_key: str) -> str:
 
 
 def _render_dashboard(user: Dict[str, str]):
-    st.title("Payments Dashboard")
+    _render_brand_header()
 
-    st.sidebar.write(f"**User:** {user['username']}")
-    if st.sidebar.button("Log out"):
-        _logout()
-        st.stop()
+    with st.sidebar:
+        st.markdown(f"### 👤 {user['username']}")
+        if st.button("Log out"):
+            _logout()
 
     st.session_state["active_transaction_id"] = None
 
@@ -449,8 +632,22 @@ def _render_dashboard(user: Dict[str, str]):
         st.write("Sample `curl` to simulate a payment:")
         st.code(_curl_example(user["api_key"]))
 
+    filters = st.session_state.get("table_filters")
+    if filters is None:
+        filters = DEFAULT_TABLE_FILTERS.copy()
+        st.session_state["table_filters"] = filters
+    page = st.session_state.get("table_page", 0)
+
     manual_refresh = st.button("Refresh now")
-    snapshot = load_snapshot(user["api_key"])
+    snapshot = load_snapshot(user["api_key"], filters, page, TABLE_PAGE_SIZE)
+    total = snapshot["table"]["total"]
+    max_page = max(0, (total - 1) // TABLE_PAGE_SIZE) if total else 0
+    if page > max_page:
+        st.session_state["table_page"] = max_page
+        rerun = getattr(st, "rerun", None)
+        if callable(rerun):
+            rerun()
+        return
     if manual_refresh:
         toast = getattr(st, "toast", None)
         if callable(toast):
@@ -458,7 +655,7 @@ def _render_dashboard(user: Dict[str, str]):
 
     _render_kpi_cards(snapshot["summary"])
     _render_charts(snapshot["daily"], snapshot["status"])
-    _render_recent_table(snapshot["recent"], snapshot["invoices"])
+    _render_transactions_section(user, snapshot)
 
     _render_invoice_modal(user)
 
@@ -570,7 +767,11 @@ def _render_transaction_detail(transaction_id: str, user: Dict[str, str]):
 
 
 def main():
-    st.set_page_config(page_title="Payments Dashboard", layout="wide")
+    st.set_page_config(
+        page_title="Payments Dashboard",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
 
     ensure_database_ready()
 
