@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from string import Template
@@ -15,7 +16,8 @@ from sqlalchemy.orm import Session
 
 from config import load_settings
 from db import get_engine, get_session_factory, init_db, session_scope
-from db.models import Transaction
+from db.models import Transaction, User
+from db.queries import get_user_by_api_key
 
 
 settings = load_settings()
@@ -81,14 +83,16 @@ def get_db() -> Session:
 
 
 def require_api_key(
-    credentials: Annotated[HTTPAuthorizationCredentials, Depends(bearer)]
-) -> str:
+    credentials: Annotated[HTTPAuthorizationCredentials, Depends(bearer)],
+    session: Annotated[Session, Depends(get_db)],
+) -> User:
     token = credentials.credentials
-    if token != settings.api_key:
+    user = get_user_by_api_key(session, token)
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key"
         )
-    return token
+    return user
 
 
 def _amount_to_cents(amount: Decimal) -> int:
@@ -113,7 +117,7 @@ def health():
 )
 def create_transaction(
     payload: TransactionCreate,
-    api_key: Annotated[str, Depends(require_api_key)],
+    user: Annotated[User, Depends(require_api_key)],
     session: Annotated[Session, Depends(get_db)],
 ):
     amount_cents = _amount_to_cents(payload.price)
@@ -121,7 +125,7 @@ def create_transaction(
     status_value = (payload.status or "success").lower()
 
     transaction = Transaction(
-        api_key=api_key,
+        api_key=user.api_key,
         customer_name=payload.name,
         customer_email=payload.email,
         amount_cents=amount_cents,
@@ -250,9 +254,9 @@ TEST_FORM_TEMPLATE = Template(
 )
 
 
-def _render_test_form(result_block: str = "") -> str:
+def _render_test_form(result_block: str = "", api_key_value: str = "") -> str:
     return TEST_FORM_TEMPLATE.substitute(
-        api_key=settings.api_key,
+        api_key=api_key_value,
         result_block=result_block,
     )
 
@@ -413,11 +417,13 @@ def payment_preview_submit(
     card_cvv: Optional[str] = Form(None),
     upi_id: Optional[str] = Form(None),
 ):
+    safe_name = html.escape(payer_name)
+    safe_method = html.escape(method.upper())
     notice = f"""
     <section style=\"max-width:600px;margin:24px auto 0;background:#ecfdf5;border-radius:12px;padding:16px 20px;border:1px solid #bbf7d0;\">
         <h2 style=\"margin-top:0;color:#047857;\">Submission Received</h2>
-        <p style=\"margin-bottom:8px;color:#065f46;\">Thanks, {payer_name}! This demo form does not process real payments.</p>
-        <p style=\"margin:0;color:#047857;\">Selected method: <strong>{method.upper()}</strong></p>
+        <p style=\"margin-bottom:8px;color:#065f46;\">Thanks, {safe_name}! This demo form does not process real payments.</p>
+        <p style=\"margin:0;color:#047857;\">Selected method: <strong>{safe_method}</strong></p>
     </section>
     """
     return HTMLResponse(content=_render_payment_form(result_block=notice))
@@ -452,15 +458,17 @@ def test_console_submit(
             payload["metadata"] = {"_error": f"Invalid metadata JSON: {exc}"}
 
     response_data: Dict[str, str] | Dict[str, object]
-    if api_key != settings.api_key:
-        status_label = """<p style="color:#b91c1c;">Error: Invalid API key</p>"""
-        response_data = {"error": "Invalid API key"}
-    else:
-        status_label = """<p style="color:#15803d;">Success</p>"""
-        with session_scope(engine=engine) as session:
+    status_label = """<p style="color:#b91c1c;">Error: Invalid API key</p>"""
+
+    with session_scope(engine=engine) as session:
+        user = get_user_by_api_key(session, api_key)
+        if not user:
+            response_data = {"error": "Invalid API key"}
+        else:
+            status_label = """<p style="color:#15803d;">Success</p>"""
             try:
                 transaction = Transaction(
-                    api_key=api_key,
+                    api_key=user.api_key,
                     customer_name=payload["name"],
                     customer_email=payload.get("email"),
                     amount_cents=_amount_to_cents(payload["price"]),
@@ -501,7 +509,7 @@ def test_console_submit(
     </section>
     """
 
-    page = _render_test_form(result_block=result_html)
+    page = _render_test_form(result_block=result_html, api_key_value=api_key)
     return HTMLResponse(content=page)
 
 

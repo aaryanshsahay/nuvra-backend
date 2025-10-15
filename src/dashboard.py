@@ -9,6 +9,7 @@ import pandas as pd
 import streamlit as st
 
 from config import load_settings
+from auth import generate_api_key, hash_password, verify_password
 from db import get_engine, init_db, session_scope
 from db.queries import (
     get_daily_volume,
@@ -16,6 +17,8 @@ from db.queries import (
     get_status_breakdown,
     get_summary,
     get_transaction_by_id,
+    get_user_by_username,
+    create_user,
 )
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -89,6 +92,7 @@ def _invoice_payloads(transactions) -> List[Dict[str, str]]:
                 "country": tx.country,
                 "city": tx.city,
                 "extra": tx.extra,
+                "api_key": tx.api_key,
             }
         )
     return payloads
@@ -176,13 +180,32 @@ def _render_invoice_viewer(data: Dict[str, str], pdf_bytes: bytes):
     st.markdown(iframe_html, unsafe_allow_html=True)
 
 
-def load_snapshot():
+def _set_current_user(user) -> None:
+    st.session_state["user"] = {
+        "id": user.id,
+        "username": user.username,
+        "api_key": user.api_key,
+    }
+    st.session_state["view"] = "dashboard"
+    st.session_state.setdefault("active_invoice", None)
+    st.session_state.setdefault("active_transaction_id", None)
+
+
+def _logout():
+    for key in ["user", "view", "active_invoice", "active_transaction_id"]:
+        st.session_state.pop(key, None)
+    rerun = getattr(st, "rerun", None)
+    if callable(rerun):
+        rerun()
+
+
+def load_snapshot(api_key: str):
     engine = ensure_database_ready()
     with session_scope(engine=engine) as session:
-        summary = get_summary(session)
-        recent = get_recent_transactions(session)
-        daily = get_daily_volume(session, days=14)
-        statuses = get_status_breakdown(session)
+        summary = get_summary(session, api_key=api_key)
+        recent = get_recent_transactions(session, api_key=api_key)
+        daily = get_daily_volume(session, days=14, api_key=api_key)
+        statuses = get_status_breakdown(session, api_key=api_key)
 
     recent_rows = _recent_transactions_rows(recent)
     display_rows = [
@@ -213,6 +236,72 @@ def load_snapshot():
         "status": status_df,
         "invoices": _invoice_payloads(recent),
     }
+
+
+def _render_auth():
+    st.title("Payments Dashboard")
+    st.caption("Sign in to view your transactions and API key.")
+
+    tabs = st.tabs(["Login", "Sign Up"])
+
+    with tabs[0]:
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login")
+
+            if submitted:
+                if not username or not password:
+                    st.error("Enter both username and password.")
+                else:
+                    engine = ensure_database_ready()
+                    with session_scope(engine=engine) as session:
+                        user = get_user_by_username(session, username)
+                    if not user or not verify_password(password, user.password_hash):
+                        st.error("Invalid credentials.")
+                    else:
+                        _set_current_user(user)
+                        toast = getattr(st, "toast", None)
+                        if callable(toast):
+                            toast("Logged in", icon="✅")
+                        rerun = getattr(st, "rerun", None)
+                        if callable(rerun):
+                            rerun()
+
+    with tabs[1]:
+        with st.form("signup_form", clear_on_submit=False):
+            username = st.text_input("Choose a username", key="signup_username")
+            password = st.text_input("Password", type="password", key="signup_password")
+            confirm = st.text_input(
+                "Confirm password", type="password", key="signup_confirm"
+            )
+            submitted = st.form_submit_button("Create account")
+
+            if submitted:
+                if not username or not password:
+                    st.error("Username and password are required.")
+                elif password != confirm:
+                    st.error("Passwords do not match.")
+                elif len(password) < 6:
+                    st.error("Use a password with at least 6 characters.")
+                else:
+                    engine = ensure_database_ready()
+                    new_user = None
+                    with session_scope(engine=engine) as session:
+                        existing = get_user_by_username(session, username)
+                        if existing:
+                            st.error("Username already taken.")
+                            session.rollback()
+                        else:
+                            password_hash = hash_password(password)
+                            api_key = generate_api_key()
+                            new_user = create_user(session, username, password_hash, api_key)
+                    if new_user is not None:
+                        _set_current_user(new_user)
+                        st.success("Account created!")
+                        rerun = getattr(st, "rerun", None)
+                        if callable(rerun):
+                            rerun()
 
 
 def _render_kpi_cards(summary: Dict[str, int]):
@@ -333,8 +422,13 @@ def _curl_example(api_key: str) -> str:
     return "\n".join(curl_lines)
 
 
-def _render_dashboard():
+def _render_dashboard(user: Dict[str, str]):
     st.title("Payments Dashboard")
+
+    st.sidebar.write(f"**User:** {user['username']}")
+    if st.sidebar.button("Log out"):
+        _logout()
+        st.stop()
 
     st.session_state["active_transaction_id"] = None
 
@@ -350,13 +444,13 @@ def _render_dashboard():
 
     with st.expander("API Access", expanded=True):
         st.write("Use the API key below to authenticate requests.")
-        st.code(settings.api_key, language=None)
-        st.caption("Key is served directly from environment configuration.")
+        st.code(user["api_key"], language=None)
+        st.caption("Each account has a unique API key. Keep it secret!")
         st.write("Sample `curl` to simulate a payment:")
-        st.code(_curl_example(settings.api_key))
+        st.code(_curl_example(user["api_key"]))
 
     manual_refresh = st.button("Refresh now")
-    snapshot = load_snapshot()
+    snapshot = load_snapshot(user["api_key"])
     if manual_refresh:
         toast = getattr(st, "toast", None)
         if callable(toast):
@@ -366,12 +460,13 @@ def _render_dashboard():
     _render_charts(snapshot["daily"], snapshot["status"])
     _render_recent_table(snapshot["recent"], snapshot["invoices"])
 
-    _render_invoice_modal()
+    _render_invoice_modal(user)
 
 
-def _render_invoice_modal():
+def _render_invoice_modal(user: Dict[str, str]):
     active = st.session_state.get("active_invoice")
-    if not active:
+    if not active or active.get("api_key") != user["api_key"]:
+        st.session_state["active_invoice"] = None
         return
 
     pdf_bytes = _generate_invoice_pdf(active)
@@ -387,7 +482,7 @@ def _render_invoice_modal():
             st.session_state["active_invoice"] = None
 
 
-def _render_transaction_detail(transaction_id: str):
+def _render_transaction_detail(transaction_id: str, user: Dict[str, str]):
     st.title("Transaction Details")
 
     st.session_state["active_invoice"] = None
@@ -404,7 +499,7 @@ def _render_transaction_detail(transaction_id: str):
     with session_scope(engine=engine) as session:
         transaction = get_transaction_by_id(session, transaction_id)
 
-    if not transaction:
+    if not transaction or transaction.api_key != user["api_key"]:
         st.warning("Transaction not found. It may have been deleted.")
         return
 
@@ -477,6 +572,13 @@ def _render_transaction_detail(transaction_id: str):
 def main():
     st.set_page_config(page_title="Payments Dashboard", layout="wide")
 
+    ensure_database_ready()
+
+    user = st.session_state.get("user")
+    if not user:
+        _render_auth()
+        return
+
     st.session_state.setdefault("view", "dashboard")
     st.session_state.setdefault("active_invoice", None)
     st.session_state.setdefault("active_transaction_id", None)
@@ -485,10 +587,10 @@ def main():
     active_transaction_id = st.session_state.get("active_transaction_id")
 
     if view == "transaction_detail" and active_transaction_id:
-        _render_transaction_detail(active_transaction_id)
+        _render_transaction_detail(active_transaction_id, user)
     else:
         st.session_state["view"] = "dashboard"
-        _render_dashboard()
+        _render_dashboard(user)
 
 
 if __name__ == "__main__":
