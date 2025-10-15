@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from string import Template
 from typing import Annotated, Dict, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Form, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -12,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from config import load_settings
-from db import get_engine, get_session_factory, init_db
+from db import get_engine, get_session_factory, init_db, session_scope
 from db.models import Transaction
 
 
@@ -156,50 +158,47 @@ def create_transaction(
     )
 
 
-@app.get("/test", response_class=HTMLResponse)
-def test_console():
-    html = f"""
+TEST_FORM_TEMPLATE = Template(
+    """
     <!DOCTYPE html>
-    <html lang=\"en\">
+    <html lang="en">
     <head>
-        <meta charset=\"utf-8\" />
+        <meta charset="utf-8" />
         <title>Payments API Tester</title>
         <style>
-            body {{
-                font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;
-                background: #f5f5f7;
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                background: #fafafa;
                 margin: 0;
                 padding: 32px;
-            }}
-            h1 {{
-                margin-bottom: 16px;
-            }}
-            form {{
+            }
+            form {
+                max-width: 520px;
+                margin: 0 auto;
                 background: #ffffff;
                 border-radius: 12px;
                 padding: 24px;
-                max-width: 640px;
                 box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
-            }}
-            label {{
+            }
+            label {
                 display: block;
-                margin-bottom: 8px;
+                margin-bottom: 6px;
                 font-weight: 600;
-            }}
-            input, textarea {{
+            }
+            input, textarea {
                 width: 100%;
                 padding: 10px 12px;
                 border-radius: 8px;
                 border: 1px solid #d1d5db;
                 font-size: 14px;
-                margin-bottom: 16px;
+                margin-bottom: 18px;
                 font-family: inherit;
-            }}
-            textarea {{
-                min-height: 120px;
+            }
+            textarea {
+                min-height: 80px;
                 resize: vertical;
-            }}
-            button {{
+            }
+            button {
                 background: #2563eb;
                 color: #ffffff;
                 border: none;
@@ -207,158 +206,303 @@ def test_console():
                 border-radius: 8px;
                 cursor: pointer;
                 font-size: 15px;
-            }}
-            button:disabled {{
-                opacity: 0.6;
-                cursor: not-allowed;
-            }}
-            pre {{
-                background: #0f172a;
-                color: #f8fafc;
-                padding: 16px;
-                border-radius: 8px;
-                overflow-x: auto;
-                max-width: 640px;
-                white-space: pre-wrap;
-                word-break: break-word;
-            }}
-            .status {{
-                margin-top: 16px;
-                font-weight: 600;
-            }}
-            .status.success {{ color: #15803d; }}
-            .status.error {{ color: #b91c1c; }}
+            }
         </style>
     </head>
     <body>
         <h1>Payments API Tester</h1>
-        <form id=\"test-form\">
-            <label for=\"api_key\">API Key</label>
-            <input type=\"text\" id=\"api_key\" name=\"api_key\" value=\"{settings.api_key}\" required />
+        <p style="max-width:520px; margin:0 auto 24px;">Submit this form to send a test transaction to <code>/transactions</code>. Results appear below the form.</p>
+        <form method="post" action="/test">
+            <label for="api_key">API Key</label>
+            <input type="text" id="api_key" name="api_key" value="${api_key}" required />
 
-            <label for=\"name\">Customer Name</label>
-            <input type=\"text\" id=\"name\" name=\"name\" value=\"Ada Lovelace\" required />
+            <label for="name">Customer Name</label>
+            <input type="text" id="name" name="name" value="Ada Lovelace" required />
 
-            <label for=\"email\">Customer Email</label>
-            <input type=\"email\" id=\"email\" name=\"email\" value=\"ada@example.com\" />
+            <label for="email">Email (optional)</label>
+            <input type="email" id="email" name="email" value="ada@example.com" />
 
-            <label for=\"price\">Amount (decimal)</label>
-            <input type=\"number\" step=\"0.01\" min=\"0\" id=\"price\" name=\"price\" value=\"19.99\" required />
+            <label for="price">Amount (decimal)</label>
+            <input type="number" step="0.01" min="0" id="price" name="price" value="19.99" required />
 
-            <label for=\"currency\">Currency</label>
-            <input type=\"text\" id=\"currency\" name=\"currency\" value=\"USD\" maxlength=\"3\" />
+            <label for="currency">Currency</label>
+            <input type="text" id="currency" name="currency" value="USD" maxlength="3" />
 
-            <label for=\"country\">Country</label>
-            <input type=\"text\" id=\"country\" name=\"country\" value=\"UK\" />
+            <label for="country">Country (optional)</label>
+            <input type="text" id="country" name="country" value="UK" />
 
-            <label for=\"city\">City</label>
-            <input type=\"text\" id=\"city\" name=\"city\" value=\"London\" />
+            <label for="city">City (optional)</label>
+            <input type="text" id="city" name="city" value="London" />
 
-            <label for=\"metadata\">Metadata (JSON)</label>
-            <textarea id=\"metadata\" name=\"metadata\">{{\n  \"product\": \"Starter Plan\",\n  \"reference\": \"INV-1001\"\n}}</textarea>
+            <label for="metadata">Metadata JSON (optional)</label>
+            <textarea id="metadata" name="metadata">{
+  "product": "Starter Plan",
+  "reference": "INV-1001"
+}</textarea>
 
-            <button type=\"submit\" id=\"submit-btn\">Send Request</button>
-            <span class=\"status\" id=\"status\"></span>
+            <button type="submit">Send request</button>
         </form>
 
-        <h2>Response</h2>
-        <pre id=\"response\">Waiting for request...</pre>
-
-        <script>
-            const form = document.getElementById('test-form');
-            const responseEl = document.getElementById('response');
-            const statusEl = document.getElementById('status');
-            const submitBtn = document.getElementById('submit-btn');
-
-            form.addEventListener('submit', async (event) => {{
-                event.preventDefault();
-                statusEl.textContent = '';
-                responseEl.textContent = 'Sending request...';
-                responseEl.className = '';
-                submitBtn.disabled = true;
-
-                const formData = new FormData(form);
-                const metadataRaw = formData.get('metadata')?.trim();
-                let metadata = undefined;
-                if (metadataRaw) {{
-                    try {{
-                        metadata = JSON.parse(metadataRaw);
-                    }} catch (err) {{
-                        submitBtn.disabled = false;
-                        statusEl.textContent = 'Invalid metadata JSON: ' + err.message;
-                        statusEl.className = 'status error';
-                        responseEl.textContent = 'Fix metadata and try again.';
-                        return;
-                    }}
-                }
-
-                const priceValue = parseFloat(formData.get('price'));
-                if (!Number.isFinite(priceValue) || priceValue <= 0) {{
-                    submitBtn.disabled = false;
-                    statusEl.textContent = 'Price must be a positive number.';
-                    statusEl.className = 'status error';
-                    responseEl.textContent = 'Fix price and try again.';
-                    return;
-                }}
-
-                const payload = {{
-                    name: formData.get('name'),
-                    email: formData.get('email') || null,
-                    price: priceValue,
-                    currency: (formData.get('currency') || 'USD').toUpperCase(),
-                    country: formData.get('country') || null,
-                    city: formData.get('city') || null,
-                }};
-
-                if (metadata !== undefined) {{
-                    payload.metadata = metadata;
-                }}
-
-                if (!payload.email) {{
-                    delete payload.email;
-                }}
-                if (!payload.country) {{
-                    delete payload.country;
-                }}
-                if (!payload.city) {{
-                    delete payload.city;
-                }}
-
-                try {{
-                    const res = await fetch('/transactions', {{
-                        method: 'POST',
-                        headers: {{
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${{formData.get('api_key')}}`
-                        }},
-                        body: JSON.stringify(payload),
-                    }});
-
-                    const text = await res.text();
-                    let parsed;
-                    try {{
-                        parsed = JSON.parse(text);
-                    }} catch (err) {{
-                        parsed = {{ raw: text }};
-                    }}
-
-                    responseEl.textContent = JSON.stringify(parsed, null, 2);
-                    statusEl.textContent = res.ok ? 'Success' : `Error ${{res.status}}`;
-                    statusEl.className = res.ok ? 'status success' : 'status error';
-                }} catch (err) {{
-                    statusEl.textContent = 'Request failed';
-                    statusEl.className = 'status error';
-                    responseEl.textContent = err.message;
-                }} finally {{
-                    submitBtn.disabled = false;
-                }}
-            }});
-        </script>
+        ${result_block}
     </body>
     </html>
     """
+)
 
-    return HTMLResponse(content=html)
+
+def _render_test_form(result_block: str = "") -> str:
+    return TEST_FORM_TEMPLATE.substitute(
+        api_key=settings.api_key,
+        result_block=result_block,
+    )
+
+
+@app.get("/test", response_class=HTMLResponse)
+def test_console():
+    return HTMLResponse(content=_render_test_form())
+
+
+PAYMENT_FORM_TEMPLATE = Template(
+    """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>Payment Checkout (Preview)</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #f4f4f8;
+            margin: 0;
+            padding: 32px;
+        }
+        form {
+            max-width: 600px;
+            margin: 0 auto;
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 28px;
+            box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+        }
+        fieldset {
+            border: none;
+            margin-bottom: 18px;
+            padding: 0;
+        }
+        legend {
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        label {
+            display: block;
+            margin-bottom: 6px;
+            font-weight: 600;
+        }
+        input, textarea {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 8px;
+            border: 1px solid #d1d5db;
+            font-size: 14px;
+            margin-bottom: 16px;
+            font-family: inherit;
+        }
+        textarea {
+            min-height: 80px;
+            resize: vertical;
+        }
+        .inline-radio {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        .inline-radio label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 500;
+        }
+        button {
+            background: #10b981;
+            color: #ffffff;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 15px;
+        }
+        button:hover {
+            background: #0f9a6b;
+        }
+    </style>
+</head>
+<body>
+    <h1 style="text-align:center; margin-bottom:24px;">Mock Checkout Form</h1>
+    <p style="text-align:center; margin-bottom:24px; color:#4b5563;">This preview form is non-functional and meant for design/testing only.</p>
+    <form method="post" action="/payment">
+        <fieldset>
+            <legend>Contact</legend>
+            <label for="payer_name">Full Name</label>
+            <input type="text" id="payer_name" name="payer_name" placeholder="Jane Doe" required />
+
+            <label for="payer_email">Email</label>
+            <input type="email" id="payer_email" name="payer_email" placeholder="jane@example.com" required />
+        </fieldset>
+
+        <fieldset>
+            <legend>Billing Address</legend>
+            <label for="address_line">Address</label>
+            <textarea id="address_line" name="address_line" placeholder="221B Baker Street, London"></textarea>
+
+            <label for="postal_code">Postal Code</label>
+            <input type="text" id="postal_code" name="postal_code" placeholder="NW1 6XE" />
+        </fieldset>
+
+        <fieldset>
+            <legend>Payment Method</legend>
+            <div class="inline-radio">
+                <label><input type="radio" name="method" value="card" checked /> Credit / Debit Card</label>
+                <label><input type="radio" name="method" value="upi" /> UPI</label>
+            </div>
+
+            <div>
+                <label for="card_number">Card Number</label>
+                <input type="text" id="card_number" name="card_number" placeholder="4242 4242 4242 4242" />
+
+                <label for="card_expiry">Expiry (MM/YY)</label>
+                <input type="text" id="card_expiry" name="card_expiry" placeholder="12/27" />
+
+                <label for="card_cvv">CVV</label>
+                <input type="text" id="card_cvv" name="card_cvv" placeholder="123" />
+            </div>
+
+            <div>
+                <label for="upi_id">UPI ID</label>
+                <input type="text" id="upi_id" name="upi_id" placeholder="username@bank" />
+            </div>
+        </fieldset>
+
+        <button type="submit">Pay Now</button>
+    </form>
+
+    ${result_block}
+</body>
+</html>
+    """
+)
+
+
+def _render_payment_form(result_block: str = "") -> str:
+    return PAYMENT_FORM_TEMPLATE.substitute(result_block=result_block)
+
+
+@app.get("/payment", response_class=HTMLResponse)
+def payment_preview():
+    return HTMLResponse(content=_render_payment_form())
+
+
+@app.post("/payment", response_class=HTMLResponse)
+def payment_preview_submit(
+    payer_name: str = Form(...),
+    payer_email: str = Form(...),
+    address_line: Optional[str] = Form(None),
+    postal_code: Optional[str] = Form(None),
+    method: str = Form("card"),
+    card_number: Optional[str] = Form(None),
+    card_expiry: Optional[str] = Form(None),
+    card_cvv: Optional[str] = Form(None),
+    upi_id: Optional[str] = Form(None),
+):
+    notice = f"""
+    <section style=\"max-width:600px;margin:24px auto 0;background:#ecfdf5;border-radius:12px;padding:16px 20px;border:1px solid #bbf7d0;\">
+        <h2 style=\"margin-top:0;color:#047857;\">Submission Received</h2>
+        <p style=\"margin-bottom:8px;color:#065f46;\">Thanks, {payer_name}! This demo form does not process real payments.</p>
+        <p style=\"margin:0;color:#047857;\">Selected method: <strong>{method.upper()}</strong></p>
+    </section>
+    """
+    return HTMLResponse(content=_render_payment_form(result_block=notice))
+
+
+@app.post("/test", response_class=HTMLResponse)
+def test_console_submit(
+    api_key: str,
+    name: str,
+    price: Decimal,
+    currency: str = "USD",
+    email: Optional[str] = None,
+    country: Optional[str] = None,
+    city: Optional[str] = None,
+    metadata: Optional[str] = None,
+):
+    payload = {
+        "name": name,
+        "price": price,
+        "currency": currency.upper(),
+    }
+    if email:
+        payload["email"] = email
+    if country:
+        payload["country"] = country
+    if city:
+        payload["city"] = city
+    if metadata:
+        try:
+            payload["metadata"] = json.loads(metadata)
+        except json.JSONDecodeError as exc:
+            payload["metadata"] = {"_error": f"Invalid metadata JSON: {exc}"}
+
+    response_data: Dict[str, str] | Dict[str, object]
+    if api_key != settings.api_key:
+        status_label = """<p style="color:#b91c1c;">Error: Invalid API key</p>"""
+        response_data = {"error": "Invalid API key"}
+    else:
+        status_label = """<p style="color:#15803d;">Success</p>"""
+        with session_scope(engine=engine) as session:
+            try:
+                transaction = Transaction(
+                    api_key=api_key,
+                    customer_name=payload["name"],
+                    customer_email=payload.get("email"),
+                    amount_cents=_amount_to_cents(payload["price"]),
+                    currency=payload["currency"],
+                    status="success",
+                    extra=payload.get("metadata"),
+                    country=payload.get("country"),
+                    city=payload.get("city"),
+                )
+
+                session.add(transaction)
+                session.flush()
+
+                response_data = {
+                    "transaction_id": transaction.transaction_id,
+                    "created_at": transaction.created_at.isoformat()
+                    if transaction.created_at
+                    else "",
+                    "amount_cents": transaction.amount_cents,
+                    "currency": transaction.currency,
+                    "status": transaction.status,
+                    "customer_name": transaction.customer_name,
+                    "customer_email": transaction.customer_email,
+                }
+            except Exception as exc:
+                status_label = (
+                    f"<p style=\"color:#b91c1c;\">Error: {exc}</p>"
+                )
+                response_data = {"error": str(exc)}
+
+    result_html = f"""
+    <section style=\"max-width:520px;margin:24px auto 0;background:#fff;border-radius:12px;padding:16px 20px;box-shadow:0 4px 12px rgba(15, 23, 42, 0.06);\">
+        <h2 style=\"margin-top:0;\">Response</h2>
+        {status_label}
+        <pre style=\"background:#0f172a;color:#f8fafc;padding:12px;border-radius:8px;overflow-x:auto;white-space:pre-wrap;\">
+{json.dumps(response_data, indent=2)}
+        </pre>
+    </section>
+    """
+
+    page = _render_test_form(result_block=result_html)
+    return HTMLResponse(content=page)
 
 
 if __name__ == "__main__":
