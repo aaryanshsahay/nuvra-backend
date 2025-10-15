@@ -106,21 +106,42 @@ def _ensure_additional_columns(engine):
         "customer_email": "TEXT",
         "country": "TEXT",
         "city": "TEXT",
+        "project_id": "INTEGER",
     }
 
     missing = {col: col_type for col, col_type in desired_columns.items() if col not in existing_columns}
-    if not missing:
-        return
+    if missing:
+        dialect = engine.dialect.name
 
-    dialect = engine.dialect.name
+        with engine.begin() as conn:
+            for column, column_type in missing.items():
+                if dialect != "sqlite":
+                    if column == "customer_email":
+                        column_type = "VARCHAR(255)"
+                    elif column in {"country", "city"}:
+                        column_type = "VARCHAR(128)"
+                    else:
+                        column_type = "INTEGER"
+                conn.execute(
+                    text(f"ALTER TABLE transactions ADD COLUMN {column} {column_type}")
+                )
 
-    with engine.begin() as conn:
-        for column, column_type in missing.items():
-            if dialect != "sqlite":
-                if column == "customer_email":
-                    column_type = "VARCHAR(255)"
-                else:
-                    column_type = "VARCHAR(128)"
-            conn.execute(
-                text(f"ALTER TABLE transactions ADD COLUMN {column} {column_type}")
-            )
+    # Ensure the projects table exists and has the required columns.
+    tables = inspector.get_table_names()
+    if "projects" not in tables:
+        projects_table = Base.metadata.tables.get("projects")
+        if projects_table is not None:
+            projects_table.create(engine)
+    else:
+        project_columns = {col["name"] for col in inspector.get_columns("projects")}
+        if "api_key" not in project_columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE projects ADD COLUMN api_key TEXT")
+                )
+            from .models import generate_project_key, Project  # local import to avoid circular deps
+
+            with session_scope(engine=engine) as session:
+                for project in session.query(Project).all():
+                    if not getattr(project, "api_key", None):
+                        project.api_key = generate_project_key()

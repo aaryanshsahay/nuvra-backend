@@ -8,6 +8,8 @@ from typing import Dict, List, Optional
 import base64
 import pandas as pd
 import streamlit as st
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from config import load_settings
 from auth import generate_api_key, hash_password, verify_password
@@ -21,6 +23,9 @@ from db.queries import (
     get_user_by_username,
     create_user,
     get_transactions_filtered,
+    create_project,
+    get_projects_for_user,
+    get_project_by_id,
 )
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -30,13 +35,16 @@ settings = load_settings()
 LOGO_PATH = Path(__file__).resolve().parent / "nuvra_logo.jpeg"
 
 TABLE_PAGE_SIZE = 100
-DEFAULT_TABLE_FILTERS = {
-    "start_date": None,
-    "end_date": None,
-    "min_amount": None,
-    "max_amount": None,
-    "statuses": [],
-}
+
+
+def default_table_filters() -> Dict[str, Optional[object]]:
+    return {
+        "start_date": None,
+        "end_date": None,
+        "min_amount": None,
+        "max_amount": None,
+        "statuses": [],
+    }
 
 
 @st.cache_resource
@@ -47,10 +55,10 @@ def ensure_database_ready():
 
 
 def _render_brand_header(subtitle: Optional[str] = None):
-    cols = st.columns([0.16, 0.84])
+    cols = st.columns([0.1, 0.9])
     with cols[0]:
         if LOGO_PATH.exists():
-            st.image(str(LOGO_PATH), use_container_width=True)
+            st.image(str(LOGO_PATH), width=120)
     with cols[1]:
         st.title("Nuvra Payments Dashboard")
         if subtitle:
@@ -60,6 +68,7 @@ def _render_brand_header(subtitle: Optional[str] = None):
 def _format_currency(amount_cents: int) -> str:
     dollars = amount_cents / 100
     return f"{settings.currency} {dollars:,.2f}"
+
 
 def _build_daily_volume_frame(daily: List[Dict[str, int]]) -> pd.DataFrame:
     if not daily:
@@ -88,6 +97,7 @@ def _invoice_payloads(transactions) -> List[Dict[str, str]]:
                 "city": tx.city,
                 "extra": tx.extra,
                 "api_key": tx.api_key,
+                "project_id": tx.project_id,
             }
         )
     return payloads
@@ -115,9 +125,7 @@ def _generate_invoice_pdf(data: Dict[str, str]) -> bytes:
     email = data.get("customer_email") or "Not provided"
     pdf.drawString(margin, cursor_y, f"Email: {email}")
     cursor_y -= 20
-    location_bits = [
-        bit for bit in [data.get("city"), data.get("country")] if bit
-    ]
+    location_bits = [bit for bit in [data.get("city"), data.get("country")] if bit]
     location = ", ".join(location_bits) if location_bits else "Not provided"
     pdf.drawString(margin, cursor_y, f"Location: {location}")
     cursor_y -= 20
@@ -182,16 +190,66 @@ def _set_current_user(user) -> None:
         "api_key": user.api_key,
     }
     st.session_state["view"] = "dashboard"
-    st.session_state.setdefault("active_invoice", None)
-    st.session_state.setdefault("active_transaction_id", None)
+    st.session_state["active_invoice"] = None
+    st.session_state["active_transaction_id"] = None
+    st.session_state["active_project_id"] = None
+    st.session_state["table_filters"] = default_table_filters()
+    st.session_state["table_page"] = 0
 
 
 def _logout():
-    for key in ["user", "view", "active_invoice", "active_transaction_id"]:
+    for key in [
+        "user",
+        "view",
+        "active_invoice",
+        "active_transaction_id",
+        "active_project_id",
+        "table_filters",
+        "table_page",
+    ]:
         st.session_state.pop(key, None)
+    _trigger_rerun()
+
+
+def _trigger_rerun():
     rerun = getattr(st, "rerun", None)
     if callable(rerun):
         rerun()
+    else:
+        rerun_alt = getattr(st, "experimental_rerun", None)
+        if callable(rerun_alt):
+            rerun_alt()
+
+
+def _fetch_projects(user_id: int):
+    engine = ensure_database_ready()
+    with session_scope(engine=engine) as session:
+        return get_projects_for_user(session, user_id)
+
+
+def _create_new_project(user_id: int, name: str):
+    engine = ensure_database_ready()
+    with session_scope(engine=engine) as session:
+        project = create_project(session, user_id=user_id, name=name)
+        return project
+
+
+def _assign_legacy_transactions(api_key: str, project_id: int):
+    engine = ensure_database_ready()
+    with session_scope(engine=engine) as session:
+        legacy_transactions = (
+            session.execute(
+                select(Transaction).where(
+                    Transaction.project_id.is_(None),
+                    Transaction.api_key == api_key,
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        for tx in legacy_transactions:
+            tx.project_id = project_id
 
 
 def _convert_filters_for_query(filters: Dict[str, object]) -> Dict[str, object]:
@@ -224,7 +282,9 @@ def _convert_filters_for_query(filters: Dict[str, object]) -> Dict[str, object]:
 def _transactions_dataframe(transactions: List[Transaction]) -> pd.DataFrame:
     rows = []
     for tx in transactions:
-        created = tx.created_at.isoformat() if isinstance(tx.created_at, datetime) else str(tx.created_at)
+        created = (
+            tx.created_at.isoformat() if isinstance(tx.created_at, datetime) else str(tx.created_at)
+        )
         rows.append(
             {
                 "Transaction": tx.transaction_id,
@@ -241,17 +301,17 @@ def _transactions_dataframe(transactions: List[Transaction]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def load_snapshot(api_key: str, table_filters: Dict[str, object], page: int, page_size: int):
+def load_snapshot(project_id: int, table_filters: Dict[str, object], page: int, page_size: int):
     engine = ensure_database_ready()
     with session_scope(engine=engine) as session:
-        summary = get_summary(session, api_key=api_key)
-        daily = get_daily_volume(session, days=14, api_key=api_key)
-        statuses = get_status_breakdown(session, api_key=api_key)
+        summary = get_summary(session, project_id=project_id)
+        daily = get_daily_volume(session, days=14, project_id=project_id)
+        statuses = get_status_breakdown(session, project_id=project_id)
 
         filter_kwargs = _convert_filters_for_query(table_filters)
         records, total = get_transactions_filtered(
             session,
-            api_key=api_key,
+            project_id=project_id,
             limit=page_size,
             offset=page * page_size,
             **filter_kwargs,
@@ -304,17 +364,13 @@ def _render_auth():
                         toast = getattr(st, "toast", None)
                         if callable(toast):
                             toast("Logged in", icon="✅")
-                        rerun = getattr(st, "rerun", None)
-                        if callable(rerun):
-                            rerun()
+                        _trigger_rerun()
 
     with tabs[1]:
         with st.form("signup_form", clear_on_submit=False):
             username = st.text_input("Choose a username", key="signup_username")
             password = st.text_input("Password", type="password", key="signup_password")
-            confirm = st.text_input(
-                "Confirm password", type="password", key="signup_confirm"
-            )
+            confirm = st.text_input("Confirm password", type="password", key="signup_confirm")
             submitted = st.form_submit_button("Create account")
 
             if submitted:
@@ -327,6 +383,7 @@ def _render_auth():
                 else:
                     engine = ensure_database_ready()
                     new_user = None
+                    new_user_id = None
                     with session_scope(engine=engine) as session:
                         existing = get_user_by_username(session, username)
                         if existing:
@@ -336,12 +393,15 @@ def _render_auth():
                             password_hash = hash_password(password)
                             api_key = generate_api_key()
                             new_user = create_user(session, username, password_hash, api_key)
+                            new_user_id = new_user.id
                     if new_user is not None:
+                        try:
+                            _create_new_project(new_user_id, "My First Project")
+                        except IntegrityError:
+                            pass
                         _set_current_user(new_user)
                         st.success("Account created!")
-                        rerun = getattr(st, "rerun", None)
-                        if callable(rerun):
-                            rerun()
+                        _trigger_rerun()
 
 
 def _render_kpi_cards(summary: Dict[str, int]):
@@ -374,7 +434,7 @@ def _render_transactions_section(user: Dict[str, str], snapshot: Dict[str, objec
 
     filters = st.session_state.get("table_filters")
     if filters is None:
-        filters = DEFAULT_TABLE_FILTERS.copy()
+        filters = default_table_filters()
         st.session_state["table_filters"] = filters
     page = st.session_state.get("table_page", 0)
 
@@ -449,7 +509,7 @@ def _render_transactions_section(user: Dict[str, str], snapshot: Dict[str, objec
                 return None
 
         if apply_filters:
-            new_filters = DEFAULT_TABLE_FILTERS.copy()
+            new_filters = default_table_filters()
             if use_start:
                 new_filters["start_date"] = start_date_input
             if use_end:
@@ -465,16 +525,12 @@ def _render_transactions_section(user: Dict[str, str], snapshot: Dict[str, objec
                 new_filters["statuses"] = status_selection
                 st.session_state["table_filters"] = new_filters
                 st.session_state["table_page"] = 0
-                rerun = getattr(st, "rerun", None)
-                if callable(rerun):
-                    rerun()
+                _trigger_rerun()
 
         if reset_filters:
-            st.session_state["table_filters"] = DEFAULT_TABLE_FILTERS.copy()
+            st.session_state["table_filters"] = default_table_filters()
             st.session_state["table_page"] = 0
-            rerun = getattr(st, "rerun", None)
-            if callable(rerun):
-                rerun()
+            _trigger_rerun()
 
     table_info = snapshot["table"]
     df = table_info["data"]
@@ -499,15 +555,11 @@ def _render_transactions_section(user: Dict[str, str], snapshot: Dict[str, objec
 
     if pager_cols[0].button("← Previous", disabled=prev_disabled):
         st.session_state["table_page"] = max(0, page - 1)
-        rerun = getattr(st, "rerun", None)
-        if callable(rerun):
-            rerun()
+        _trigger_rerun()
 
     if pager_cols[1].button("Next →", disabled=next_disabled):
         st.session_state["table_page"] = page + 1
-        rerun = getattr(st, "rerun", None)
-        if callable(rerun):
-            rerun()
+        _trigger_rerun()
 
     if records:
         st.write("---")
@@ -526,9 +578,7 @@ def _render_transactions_section(user: Dict[str, str], snapshot: Dict[str, objec
                     st.session_state["view"] = "transaction_detail"
                     st.session_state["active_transaction_id"] = tx_id
                     st.session_state["active_invoice"] = None
-                    rerun = getattr(st, "rerun", None)
-                    if callable(rerun):
-                        rerun()
+                    _trigger_rerun()
                 st.caption(tx_id)
 
             cols[1].markdown(tx.customer_name)
@@ -560,6 +610,7 @@ def _render_transactions_section(user: Dict[str, str], snapshot: Dict[str, objec
                         "city": tx.city,
                         "extra": tx.extra,
                         "api_key": tx.api_key,
+                        "project_id": tx.project_id,
                     }
 
 
@@ -585,9 +636,10 @@ def _render_charts(daily_df: pd.DataFrame, status_df: pd.DataFrame):
             )
 
 
-def _curl_example(api_key: str) -> str:
+def _curl_example(api_key: str, project_name: str) -> str:
     endpoint = "http://localhost:8000/transactions"
     payload = """{
+  "project": "PROJECT_NAME",
   "name": "Ada Lovelace",
   "email": "ada@example.com",
   "price": 19.99,
@@ -600,7 +652,7 @@ def _curl_example(api_key: str) -> str:
         f"  '{endpoint}' \\",
         f"  -H 'Authorization: Bearer {api_key}' \\",
         "  -H 'Content-Type: application/json' \\",
-        f"  -d '{payload}'",
+        f"  -d '{payload.replace('PROJECT_NAME', project_name)}'",
     ]
     return "\n".join(curl_lines)
 
@@ -608,11 +660,98 @@ def _curl_example(api_key: str) -> str:
 def _render_dashboard(user: Dict[str, str]):
     _render_brand_header()
 
+    projects = _fetch_projects(user["id"])
+
+    if not projects:
+        with st.sidebar:
+            st.markdown(f"### 👤 {user['username']}")
+            if st.button("Log out"):
+                _logout()
+                st.stop()
+
+        st.info("No projects yet. Create one to start tracking transactions.")
+        with st.form("create_first_project"):
+            project_name = st.text_input("Project name", placeholder="My First Project")
+            created = st.form_submit_button("Create project")
+            if created:
+                cleaned = project_name.strip()
+                if not cleaned:
+                    st.error("Project name is required.")
+                else:
+                    try:
+                        project = _create_new_project(user["id"], cleaned)
+                    except IntegrityError:
+                        st.error("You already have a project with that name.")
+                    else:
+                        st.session_state["active_project_id"] = project.id
+                        st.session_state["table_filters"] = default_table_filters()
+                        st.session_state["table_page"] = 0
+                        st.session_state["active_invoice"] = None
+                        st.session_state["active_transaction_id"] = None
+                        st.success("Project created!")
+                        _trigger_rerun()
+        return
+
+    project_ids = [proj.id for proj in projects]
+    active_project_id = st.session_state.get("active_project_id")
+    if active_project_id not in project_ids:
+        active_project_id = projects[0].id
+        st.session_state["active_project_id"] = active_project_id
+
+    active_project = next(proj for proj in projects if proj.id == active_project_id)
+
     with st.sidebar:
         st.markdown(f"### 👤 {user['username']}")
         if st.button("Log out"):
             _logout()
+            st.stop()
 
+        st.markdown("### Projects")
+        project_names = [proj.name for proj in projects]
+        current_index = project_ids.index(active_project_id)
+        selected_name = st.selectbox(
+            "Active project",
+            project_names,
+            index=current_index,
+            key="project_selector",
+        )
+        selected_project = projects[project_names.index(selected_name)]
+        if selected_project.id != active_project_id:
+            st.session_state["active_project_id"] = selected_project.id
+            st.session_state["table_filters"] = default_table_filters()
+            st.session_state["table_page"] = 0
+            st.session_state["active_invoice"] = None
+            st.session_state["active_transaction_id"] = None
+            _trigger_rerun()
+            st.stop()
+        active_project = selected_project
+
+        with st.form("add_project_form", clear_on_submit=True):
+            new_project_name = st.text_input("New project", placeholder="Sandbox")
+            create_submit = st.form_submit_button("+ Create")
+        if create_submit:
+            cleaned = new_project_name.strip()
+            if not cleaned:
+                st.warning("Provide a project name.")
+            else:
+                try:
+                    project = _create_new_project(user["id"], cleaned)
+                except IntegrityError:
+                    st.error("You already have a project with that name.")
+                else:
+                    st.session_state["active_project_id"] = project.id
+                    st.session_state["table_filters"] = default_table_filters()
+                    st.session_state["table_page"] = 0
+                    st.session_state["active_invoice"] = None
+                    st.session_state["active_transaction_id"] = None
+                    st.success("Project created!")
+                    _trigger_rerun()
+                    st.stop()
+
+        st.caption(f"Active project: {active_project.name}")
+
+    _assign_legacy_transactions(user["api_key"], active_project.id)
+    st.markdown(f"**Active project:** {active_project.name}")
     st.session_state["active_transaction_id"] = None
 
     active_invoice = st.session_state.get("active_invoice")
@@ -628,25 +767,29 @@ def _render_dashboard(user: Dict[str, str]):
     with st.expander("API Access", expanded=True):
         st.write("Use the API key below to authenticate requests.")
         st.code(user["api_key"], language=None)
-        st.caption("Each account has a unique API key. Keep it secret!")
+        st.caption(
+            "Each account has a unique API key. Include the project name when creating transactions."
+        )
         st.write("Sample `curl` to simulate a payment:")
-        st.code(_curl_example(user["api_key"]))
+        st.code(_curl_example(user["api_key"], active_project.name))
 
     filters = st.session_state.get("table_filters")
     if filters is None:
-        filters = DEFAULT_TABLE_FILTERS.copy()
+        filters = default_table_filters()
         st.session_state["table_filters"] = filters
     page = st.session_state.get("table_page", 0)
 
     manual_refresh = st.button("Refresh now")
-    snapshot = load_snapshot(user["api_key"], filters, page, TABLE_PAGE_SIZE)
+    project_id = active_project.id
+    if project_id is None:
+        st.warning("Select a project to view analytics.")
+        return
+    snapshot = load_snapshot(project_id, filters, page, TABLE_PAGE_SIZE)
     total = snapshot["table"]["total"]
     max_page = max(0, (total - 1) // TABLE_PAGE_SIZE) if total else 0
     if page > max_page:
         st.session_state["table_page"] = max_page
-        rerun = getattr(st, "rerun", None)
-        if callable(rerun):
-            rerun()
+        _trigger_rerun()
         return
     if manual_refresh:
         toast = getattr(st, "toast", None)
@@ -657,12 +800,16 @@ def _render_dashboard(user: Dict[str, str]):
     _render_charts(snapshot["daily"], snapshot["status"])
     _render_transactions_section(user, snapshot)
 
-    _render_invoice_modal(user)
+    _render_invoice_modal(user, active_project.id)
 
 
-def _render_invoice_modal(user: Dict[str, str]):
+def _render_invoice_modal(user: Dict[str, str], project_id: int):
     active = st.session_state.get("active_invoice")
-    if not active or active.get("api_key") != user["api_key"]:
+    if (
+        not active
+        or active.get("api_key") != user["api_key"]
+        or active.get("project_id") != project_id
+    ):
         st.session_state["active_invoice"] = None
         return
 
@@ -679,7 +826,9 @@ def _render_invoice_modal(user: Dict[str, str]):
             st.session_state["active_invoice"] = None
 
 
-def _render_transaction_detail(transaction_id: str, user: Dict[str, str]):
+def _render_transaction_detail(
+    transaction_id: str, user: Dict[str, str], project_id: Optional[int]
+):
     st.title("Transaction Details")
 
     st.session_state["active_invoice"] = None
@@ -688,43 +837,41 @@ def _render_transaction_detail(transaction_id: str, user: Dict[str, str]):
         st.session_state["view"] = "dashboard"
         st.session_state["active_transaction_id"] = None
         st.session_state["active_invoice"] = None
-        rerun = getattr(st, "rerun", None)
-        if callable(rerun):
-            rerun()
+        _trigger_rerun()
 
     engine = ensure_database_ready()
     with session_scope(engine=engine) as session:
         transaction = get_transaction_by_id(session, transaction_id)
+        project = get_project_by_id(session, project_id) if project_id else None
 
-    if not transaction or transaction.api_key != user["api_key"]:
-        st.warning("Transaction not found. It may have been deleted.")
+    if (
+        not transaction
+        or transaction.api_key != user["api_key"]
+        or (project_id is not None and transaction.project_id != project_id)
+    ):
+        st.warning("Transaction not found in this project.")
         return
 
     info_columns = st.columns(4)
-    info_columns[0].markdown(
-        f"**Customer**\n\n{transaction.customer_name}"
-    )
-    info_columns[1].markdown(
-        f"**Email**\n\n{transaction.customer_email or '—'}"
-    )
-    info_columns[2].markdown(
-        f"**Amount**\n\n{_format_currency(transaction.amount_cents)}"
-    )
-    info_columns[3].markdown(
-        f"**Status**\n\n{transaction.status.title()}"
-    )
+    info_columns[0].markdown(f"**Customer**\n\n{transaction.customer_name}")
+    info_columns[1].markdown(f"**Email**\n\n{transaction.customer_email or '—'}")
+    info_columns[2].markdown(f"**Amount**\n\n{_format_currency(transaction.amount_cents)}")
+    info_columns[3].markdown(f"**Status**\n\n{transaction.status.title()}")
 
     meta_cols = st.columns(2)
     meta_cols[0].markdown(f"**Transaction ID**\n\n`{transaction.transaction_id}`")
     meta_cols[0].markdown(f"**API Key**\n\n`{transaction.api_key}`")
+    if project:
+        meta_cols[0].markdown(f"**Project**\n\n{project.name}")
     created_display = (
         transaction.created_at.isoformat()
         if isinstance(transaction.created_at, datetime)
         else str(transaction.created_at)
     )
-    location = ", ".join(
-        [piece for piece in [transaction.city, transaction.country] if piece]
-    ) or "Not provided"
+    location = (
+        ", ".join([piece for piece in [transaction.city, transaction.country] if piece])
+        or "Not provided"
+    )
     meta_cols[1].markdown(f"**Created At**\n\n{created_display}")
     meta_cols[1].markdown(f"**Location**\n\n{location}")
 
@@ -741,6 +888,8 @@ def _render_transaction_detail(transaction_id: str, user: Dict[str, str]):
         "country": transaction.country,
         "city": transaction.city,
         "extra": transaction.extra,
+        "api_key": transaction.api_key,
+        "project_id": transaction.project_id,
     }
     pdf_bytes = _generate_invoice_pdf(invoice_payload)
     _render_invoice_viewer(invoice_payload, pdf_bytes)
@@ -757,6 +906,7 @@ def _render_transaction_detail(transaction_id: str, user: Dict[str, str]):
         "Status": transaction.status,
         "Transaction ID": transaction.transaction_id,
         "API Key": transaction.api_key,
+        "Project": project.name if project else "Unknown",
         "Created At": created_display,
     }
     st.json(meta_data)
@@ -786,9 +936,10 @@ def main():
 
     view = st.session_state.get("view", "dashboard")
     active_transaction_id = st.session_state.get("active_transaction_id")
+    active_project_id = st.session_state.get("active_project_id")
 
     if view == "transaction_detail" and active_transaction_id:
-        _render_transaction_detail(active_transaction_id, user)
+        _render_transaction_detail(active_transaction_id, user, active_project_id)
     else:
         st.session_state["view"] = "dashboard"
         _render_dashboard(user)

@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from config import load_settings
 from db import get_engine, get_session_factory, init_db, session_scope
 from db.models import Transaction, User
-from db.queries import get_user_by_api_key
+from db.queries import get_project_by_name, get_user_by_api_key
 
 
 settings = load_settings()
@@ -40,6 +40,7 @@ bearer = HTTPBearer(auto_error=True)
 
 
 class TransactionCreate(BaseModel):
+    project: constr(min_length=1, max_length=255)
     name: constr(min_length=1, max_length=255)
     email: Optional[str] = Field(
         default=None,
@@ -68,6 +69,7 @@ class TransactionResponse(BaseModel):
     country: Optional[str]
     city: Optional[str]
     metadata: Optional[Dict[str, str]]
+    project: Optional[str]
 
 
 def get_db() -> Session:
@@ -120,12 +122,27 @@ def create_transaction(
     user: Annotated[User, Depends(require_api_key)],
     session: Annotated[Session, Depends(get_db)],
 ):
+    project_name = payload.project.strip()
+    if not project_name:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Project name is required.",
+        )
+
+    project = get_project_by_name(session, user.id, project_name)
+    if project is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found. Create it first via the dashboard.",
+        )
+
     amount_cents = _amount_to_cents(payload.price)
     currency = (payload.currency or settings.currency).upper()
     status_value = (payload.status or "success").lower()
 
     transaction = Transaction(
         api_key=user.api_key,
+        project_id=project.id,
         customer_name=payload.name,
         customer_email=payload.email,
         amount_cents=amount_cents,
@@ -159,6 +176,7 @@ def create_transaction(
         country=transaction.country,
         city=transaction.city,
         metadata=transaction.extra,
+        project=project.name,
     )
 
 
@@ -219,6 +237,9 @@ TEST_FORM_TEMPLATE = Template(
         <form method="post" action="/test">
             <label for="api_key">API Key</label>
             <input type="text" id="api_key" name="api_key" value="${api_key}" required />
+
+            <label for="project">Project Name</label>
+            <input type="text" id="project" name="project" value="My First Project" required />
 
             <label for="name">Customer Name</label>
             <input type="text" id="name" name="name" value="Ada Lovelace" required />
@@ -432,6 +453,7 @@ def payment_preview_submit(
 @app.post("/test", response_class=HTMLResponse)
 def test_console_submit(
     api_key: str,
+    project: str,
     name: str,
     price: Decimal,
     currency: str = "USD",
@@ -440,7 +462,10 @@ def test_console_submit(
     city: Optional[str] = None,
     metadata: Optional[str] = None,
 ):
+    project_clean = project.strip()
+
     payload = {
+        "project": project_clean,
         "name": name,
         "price": price,
         "currency": currency.upper(),
@@ -465,39 +490,49 @@ def test_console_submit(
         if not user:
             response_data = {"error": "Invalid API key"}
         else:
-            status_label = """<p style="color:#15803d;">Success</p>"""
-            try:
-                transaction = Transaction(
-                    api_key=user.api_key,
-                    customer_name=payload["name"],
-                    customer_email=payload.get("email"),
-                    amount_cents=_amount_to_cents(payload["price"]),
-                    currency=payload["currency"],
-                    status="success",
-                    extra=payload.get("metadata"),
-                    country=payload.get("country"),
-                    city=payload.get("city"),
-                )
+            if not project_clean:
+                response_data = {"error": "Project name is required"}
+            else:
+                project_obj = get_project_by_name(session, user.id, project_clean)
+            if project_obj is None:
+                response_data = {"error": "Project not found"}
+            else:
+                safe_project = html.escape(project_obj.name)
+                status_label = f"<p style=\"color:#15803d;\">Success · <strong>{safe_project}</strong></p>"
+                try:
+                    transaction = Transaction(
+                        api_key=user.api_key,
+                        project_id=project_obj.id,
+                        customer_name=payload["name"],
+                        customer_email=payload.get("email"),
+                        amount_cents=_amount_to_cents(payload["price"]),
+                        currency=payload["currency"],
+                        status="success",
+                        extra=payload.get("metadata"),
+                        country=payload.get("country"),
+                        city=payload.get("city"),
+                    )
 
-                session.add(transaction)
-                session.flush()
+                    session.add(transaction)
+                    session.flush()
 
-                response_data = {
-                    "transaction_id": transaction.transaction_id,
-                    "created_at": transaction.created_at.isoformat()
-                    if transaction.created_at
-                    else "",
-                    "amount_cents": transaction.amount_cents,
-                    "currency": transaction.currency,
-                    "status": transaction.status,
-                    "customer_name": transaction.customer_name,
-                    "customer_email": transaction.customer_email,
-                }
-            except Exception as exc:
-                status_label = (
-                    f"<p style=\"color:#b91c1c;\">Error: {exc}</p>"
-                )
-                response_data = {"error": str(exc)}
+                    response_data = {
+                        "transaction_id": transaction.transaction_id,
+                        "created_at": transaction.created_at.isoformat()
+                        if transaction.created_at
+                        else "",
+                        "amount_cents": transaction.amount_cents,
+                        "currency": transaction.currency,
+                        "status": transaction.status,
+                        "customer_name": transaction.customer_name,
+                        "customer_email": transaction.customer_email,
+                        "project": project_obj.name,
+                    }
+                except Exception as exc:
+                    status_label = (
+                        f"<p style=\"color:#b91c1c;\">Error: {exc}</p>"
+                    )
+                    response_data = {"error": str(exc)}
 
     result_html = f"""
     <section style=\"max-width:520px;margin:24px auto 0;background:#fff;border-radius:12px;padding:16px 20px;box-shadow:0 4px 12px rgba(15, 23, 42, 0.06);\">

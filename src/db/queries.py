@@ -8,17 +8,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.engine import Result
 from sqlalchemy.orm import Session
 
-from .models import Transaction, User
-
-
-def get_recent_transactions(
-    session: Session, limit: int = 20, api_key: Optional[str] = None
-) -> List[Transaction]:
-    stmt = select(Transaction)
-    if api_key:
-        stmt = stmt.where(Transaction.api_key == api_key)
-    stmt = stmt.order_by(Transaction.created_at.desc()).limit(limit)
-    return session.execute(stmt).scalars().all()
+from .models import Project, Transaction, User
 
 
 def _scalar(session: Session, stmt, default=0):
@@ -26,17 +16,17 @@ def _scalar(session: Session, stmt, default=0):
     return result if result is not None else default
 
 
-def get_summary(session: Session, api_key: Optional[str] = None) -> Dict[str, float]:
+def get_summary(session: Session, project_id: Optional[int] = None) -> Dict[str, float]:
     amount_stmt = select(func.coalesce(func.sum(Transaction.amount_cents), 0))
     count_stmt = select(func.count(Transaction.id))
     distinct_stmt = select(func.count(func.distinct(Transaction.customer_name)))
     success_stmt = select(func.count(Transaction.id)).where(Transaction.status == "success")
 
-    if api_key:
-        amount_stmt = amount_stmt.where(Transaction.api_key == api_key)
-        count_stmt = count_stmt.where(Transaction.api_key == api_key)
-        distinct_stmt = distinct_stmt.where(Transaction.api_key == api_key)
-        success_stmt = success_stmt.where(Transaction.api_key == api_key)
+    if project_id is not None:
+        amount_stmt = amount_stmt.where(Transaction.project_id == project_id)
+        count_stmt = count_stmt.where(Transaction.project_id == project_id)
+        distinct_stmt = distinct_stmt.where(Transaction.project_id == project_id)
+        success_stmt = success_stmt.where(Transaction.project_id == project_id)
 
     total_amount_cents = _scalar(session, amount_stmt)
     total_transactions = _scalar(session, count_stmt)
@@ -53,8 +43,8 @@ def get_summary(session: Session, api_key: Optional[str] = None) -> Dict[str, fl
     )
 
     latest_stmt = select(Transaction.created_at).order_by(Transaction.created_at.desc()).limit(1)
-    if api_key:
-        latest_stmt = latest_stmt.where(Transaction.api_key == api_key)
+    if project_id is not None:
+        latest_stmt = latest_stmt.where(Transaction.project_id == project_id)
     latest = session.execute(latest_stmt).scalar_one_or_none()
 
     return {
@@ -68,7 +58,7 @@ def get_summary(session: Session, api_key: Optional[str] = None) -> Dict[str, fl
 
 
 def get_daily_volume(
-    session: Session, days: int = 7, api_key: Optional[str] = None
+    session: Session, days: int = 7, project_id: Optional[int] = None
 ) -> List[Dict[str, float]]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days - 1)
     stmt = (
@@ -81,8 +71,8 @@ def get_daily_volume(
         .group_by("day")
         .order_by("day")
     )
-    if api_key:
-        stmt = stmt.where(Transaction.api_key == api_key)
+    if project_id is not None:
+        stmt = stmt.where(Transaction.project_id == project_id)
     result: Result = session.execute(stmt)
 
     return [
@@ -96,13 +86,13 @@ def get_daily_volume(
 
 
 def get_status_breakdown(
-    session: Session, api_key: Optional[str] = None
+    session: Session, project_id: Optional[int] = None
 ) -> Dict[str, int]:
     stmt = select(Transaction.status, func.count(Transaction.id)).group_by(
         Transaction.status
     )
-    if api_key:
-        stmt = stmt.where(Transaction.api_key == api_key)
+    if project_id is not None:
+        stmt = stmt.where(Transaction.project_id == project_id)
 
     breakdown: Dict[str, int] = defaultdict(int)
     for status, count in session.execute(stmt):
@@ -139,16 +129,41 @@ def create_user(
     return user
 
 
+def create_project(session: Session, user_id: int, name: str) -> Project:
+    project = Project(user_id=user_id, name=name)
+    session.add(project)
+    session.flush()
+    return project
+
+
+def get_projects_for_user(session: Session, user_id: int) -> List[Project]:
+    stmt = select(Project).where(Project.user_id == user_id).order_by(Project.created_at)
+    return session.execute(stmt).scalars().all()
+
+
+def get_project_by_id(session: Session, project_id: int) -> Optional[Project]:
+    stmt = select(Project).where(Project.id == project_id)
+    return session.execute(stmt).scalar_one_or_none()
+
+
+def get_project_by_name(session: Session, user_id: int, name: str) -> Optional[Project]:
+    stmt = select(Project).where(
+        Project.user_id == user_id,
+        func.lower(Project.name) == func.lower(name),
+    )
+    return session.execute(stmt).scalar_one_or_none()
+
+
 def _apply_transaction_filters(
     stmt,
-    api_key: str,
+    project_id: int,
     start_at: Optional[datetime] = None,
     end_at: Optional[datetime] = None,
     min_amount_cents: Optional[int] = None,
     max_amount_cents: Optional[int] = None,
     statuses: Optional[Sequence[str]] = None,
 ):
-    conditions = [Transaction.api_key == api_key]
+    conditions = [Transaction.project_id == project_id]
     if start_at:
         conditions.append(Transaction.created_at >= start_at)
     if end_at:
@@ -165,7 +180,7 @@ def _apply_transaction_filters(
 
 def get_transactions_filtered(
     session: Session,
-    api_key: str,
+    project_id: int,
     limit: int,
     offset: int = 0,
     start_at: Optional[datetime] = None,
@@ -177,7 +192,7 @@ def get_transactions_filtered(
     base_stmt = select(Transaction).order_by(Transaction.created_at.desc())
     base_stmt = _apply_transaction_filters(
         base_stmt,
-        api_key=api_key,
+        project_id=project_id,
         start_at=start_at,
         end_at=end_at,
         min_amount_cents=min_amount_cents,
@@ -191,7 +206,7 @@ def get_transactions_filtered(
     count_stmt = select(func.count(Transaction.id))
     count_stmt = _apply_transaction_filters(
         count_stmt,
-        api_key=api_key,
+        project_id=project_id,
         start_at=start_at,
         end_at=end_at,
         min_amount_cents=min_amount_cents,

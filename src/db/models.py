@@ -1,13 +1,46 @@
 from datetime import datetime, timezone
+import secrets
 from uuid import uuid4
 
-from sqlalchemy import Column, DateTime, Index, Integer, JSON, String, Text, func
+from sqlalchemy import (
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    func,
+)
 
 from . import Base
 
 
 def generate_transaction_id() -> str:
     return str(uuid4())
+
+
+def generate_project_key() -> str:
+    return secrets.token_urlsafe(32)
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(255), nullable=False)
+    api_key = Column(String(128), nullable=False, unique=True, default=generate_project_key)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=func.now(),
+    )
+
+
+Index("ix_projects_user_name", Project.user_id, Project.name, unique=True)
 
 
 class Transaction(Base):
@@ -17,6 +50,7 @@ class Transaction(Base):
     transaction_id = Column(
         String(36), nullable=False, unique=True, default=generate_transaction_id
     )
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True)
     api_key = Column(String(128), nullable=False, index=True)
     customer_name = Column(String(255), nullable=False)
     customer_email = Column(String(255), nullable=True, index=True)
@@ -35,7 +69,7 @@ class Transaction(Base):
     )
 
 
-Index("ix_transactions_api_key_created_at", Transaction.api_key, Transaction.created_at)
+Index("ix_transactions_project_created_at", Transaction.project_id, Transaction.created_at)
 
 
 class Merchant(Base):
