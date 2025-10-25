@@ -2,3 +2,5 @@
 /db/___pycache__
 /venv
 src/data/payments.db
+.DS_Store
+src/data/payments.db
